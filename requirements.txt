@@ -6,6 +6,4 @@ requests==2.31.0
 psutil==5.9.5
 # Headless streaming dependencies
 Pillow>=10.4.0
-numpy>=1.24.0
-opencv-python-headless>=4.8.0
-selenium>=4.15.0
+websocket-client>=1.6.0
