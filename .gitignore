@@ -3,6 +3,7 @@
 .env.local
 .env.*.local
 .streamdrop_auth
+.streamdrop_secret
 
 # User data
 streams.db

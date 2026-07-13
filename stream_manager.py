@@ -9,23 +9,44 @@ import sys
 import json
 import time
 import uuid
+import shutil
+import hashlib
 import logging
 import signal
+import socket
 import sqlite3
 import subprocess
 from pathlib import Path
 from datetime import datetime, timedelta
-from threading import Thread, Lock
+from threading import Thread, RLock
 from functools import wraps
 from flask import Flask, render_template, request, jsonify, Response, session, redirect, url_for, flash
 
 # Setup logging
-logging.basicConfig(level=logging.INFO, 
+logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('stream-manager')
 
-# Global lock for thread-safe operations
-stream_lock = Lock()
+# Global lock for thread-safe operations. Reentrant: StreamManager methods
+# that hold it (update_stream, delete_stream) call stop_stream/start_stream,
+# which acquire it again on the same thread.
+stream_lock = RLock()
+
+# Directory containing this file (capture helper scripts live alongside it)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def find_browser():
+    """Locate an installed Chromium/Chrome binary."""
+    override = os.environ.get('STREAMDROP_BROWSER')
+    if override and (os.path.exists(override) or shutil.which(override)):
+        return override
+    for candidate in ('chromium-browser', 'chromium', 'google-chrome',
+                      'google-chrome-stable', 'chrome'):
+        path = shutil.which(candidate)
+        if path:
+            return path
+    return None
 
 class StreamDatabase:
     """SQLite database manager for stream configurations"""
@@ -54,6 +75,7 @@ class StreamDatabase:
                 thumbnail TEXT DEFAULT '',
                 rtmp_url TEXT DEFAULT '',
                 custom_settings TEXT DEFAULT '',
+                orientation TEXT DEFAULT 'auto',
                 project_id TEXT DEFAULT NULL,
                 audio_config TEXT DEFAULT '{}',
                 schedule_config TEXT DEFAULT '{}',
@@ -176,20 +198,55 @@ class StreamDatabase:
         
         conn.commit()
         conn.close()
-        
+
+        # Migrate older databases that predate the orientation column
+        self._ensure_column('streams', 'orientation', "TEXT DEFAULT 'auto'")
+
         # Initialize platform configurations
         self.initialize_platform_configs()
-    
+
+    def _ensure_column(self, table, column, definition):
+        """Add a column to an existing table if it's missing (simple migration)"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(f'PRAGMA table_info({table})')
+        columns = [row[1] for row in cursor.fetchall()]
+        if column not in columns:
+            cursor.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
+            conn.commit()
+        conn.close()
+
+    @staticmethod
+    def _parse_stream_row(row):
+        """Convert a stream DB row to a dict with JSON fields decoded"""
+        stream = dict(row)
+        json_fields = {
+            'custom_settings': {},
+            'audio_config': {},
+            'schedule_config': {},
+            'multi_stream_targets': [],
+        }
+        for field, default in json_fields.items():
+            value = stream.get(field)
+            if isinstance(value, str) and value:
+                try:
+                    stream[field] = json.loads(value)
+                except (ValueError, TypeError):
+                    stream[field] = default
+            elif not isinstance(value, (dict, list)):
+                stream[field] = default
+        return stream
+
     def create_stream(self, stream_data):
         """Create a new stream configuration"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        
+
         stream_id = str(uuid.uuid4())
         cursor.execute('''
-            INSERT INTO streams (id, name, type, platform, stream_key, source, 
-                               quality, title, description, rtmp_url, custom_settings)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO streams (id, name, type, platform, stream_key, source,
+                               quality, title, description, rtmp_url, custom_settings, orientation)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             stream_id,
             stream_data['name'],
@@ -201,61 +258,41 @@ class StreamDatabase:
             stream_data.get('title', ''),
             stream_data.get('description', ''),
             stream_data.get('rtmp_url', ''),
-            json.dumps(stream_data.get('custom_settings', {}))
+            json.dumps(stream_data.get('custom_settings', {})),
+            stream_data.get('orientation', 'auto')
         ))
-        
+
         conn.commit()
         conn.close()
         return stream_id
-    
+
     def get_all_streams(self):
         """Get all stream configurations"""
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        
+
         cursor.execute('SELECT * FROM streams ORDER BY created_at DESC')
-        streams = []
-        for row in cursor.fetchall():
-            stream = dict(row)
-            # Parse custom_settings JSON
-            if stream.get('custom_settings'):
-                try:
-                    stream['custom_settings'] = json.loads(stream['custom_settings'])
-                except:
-                    stream['custom_settings'] = {}
-            else:
-                stream['custom_settings'] = {}
-            streams.append(stream)
-        
+        streams = [self._parse_stream_row(row) for row in cursor.fetchall()]
+
         conn.close()
         return streams
-    
+
     def get_stream(self, stream_id):
         """Get a specific stream configuration"""
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        
+
         cursor.execute('SELECT * FROM streams WHERE id = ?', (stream_id,))
         row = cursor.fetchone()
-        
+
         conn.close()
-        
+
         if not row:
             return None
-            
-        stream = dict(row)
-        # Parse custom_settings JSON
-        if stream.get('custom_settings'):
-            try:
-                stream['custom_settings'] = json.loads(stream['custom_settings'])
-            except:
-                stream['custom_settings'] = {}
-        else:
-            stream['custom_settings'] = {}
-            
-        return stream
+
+        return self._parse_stream_row(row)
     
     def update_stream_status(self, stream_id, status, start_time=None):
         """Update stream status"""
@@ -306,13 +343,19 @@ class StreamDatabase:
         # Build dynamic update query based on provided data
         update_fields = []
         values = []
-        
-        allowed_fields = ['name', 'title', 'description', 'quality', 'source', 'stream_key', 'rtmp_url']
-        
-        # Handle custom_settings as JSON
-        if 'custom_settings' in stream_data:
-            update_fields.append('custom_settings = ?')
-            values.append(json.dumps(stream_data['custom_settings']))
+
+        allowed_fields = ['name', 'title', 'description', 'quality', 'source',
+                          'stream_key', 'rtmp_url', 'platform', 'type', 'orientation']
+        json_fields = ['custom_settings', 'audio_config', 'schedule_config', 'multi_stream_targets']
+
+        # Handle JSON-encoded fields (accept dict/list or a pre-encoded string)
+        for field in json_fields:
+            if field in stream_data:
+                value = stream_data[field]
+                if not isinstance(value, str):
+                    value = json.dumps(value)
+                update_fields.append(f'{field} = ?')
+                values.append(value)
         for field in allowed_fields:
             if field in stream_data:
                 update_fields.append(f'{field} = ?')
@@ -829,9 +872,208 @@ class StreamDatabase:
             else:
                 platform['recommended_settings'] = {}
             platforms.append(platform)
-        
+
         conn.close()
         return platforms
+
+    def get_template(self, template_id):
+        """Get a specific stream template"""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        cursor.execute('SELECT * FROM stream_templates WHERE id = ?', (template_id,))
+        row = cursor.fetchone()
+        conn.close()
+
+        if not row:
+            return None
+
+        template = dict(row)
+        try:
+            template['template_config'] = json.loads(template['template_config'] or '{}')
+        except (ValueError, TypeError):
+            template['template_config'] = {}
+        return template
+
+    def update_template(self, template_id, template_data):
+        """Update a stream template"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        update_fields = []
+        values = []
+
+        for field in ['name', 'description', 'category']:
+            if field in template_data:
+                update_fields.append(f'{field} = ?')
+                values.append(template_data[field])
+
+        if 'template_config' in template_data:
+            update_fields.append('template_config = ?')
+            values.append(json.dumps(template_data['template_config']))
+
+        if not update_fields:
+            conn.close()
+            return False
+
+        values.append(template_id)
+        cursor.execute(f'UPDATE stream_templates SET {", ".join(update_fields)} WHERE id = ?', values)
+
+        success = cursor.rowcount > 0
+        conn.commit()
+        conn.close()
+        return success
+
+    def delete_template(self, template_id):
+        """Delete a stream template"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute('DELETE FROM stream_templates WHERE id = ?', (template_id,))
+
+        success = cursor.rowcount > 0
+        conn.commit()
+        conn.close()
+        return success
+
+    def create_stream_from_template(self, template_id, stream_data):
+        """Create a new stream from a template, with per-stream overrides"""
+        template = self.get_template(template_id)
+        if not template:
+            return None
+
+        merged = dict(template.get('template_config', {}))
+        merged.update(stream_data or {})
+
+        # A usable stream needs these at minimum
+        required = ['name', 'type', 'platform', 'stream_key', 'source']
+        if not all(merged.get(field) for field in required):
+            return None
+
+        return self.create_stream(merged)
+
+    def create_platform_config(self, platform_data):
+        """Create a new platform configuration"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        recommended = platform_data.get('recommended_settings', {})
+        if not isinstance(recommended, str):
+            recommended = json.dumps(recommended)
+
+        cursor.execute('''
+            INSERT INTO platform_configs
+            (platform_name, display_name, rtmp_url, supports_auth, max_bitrate, recommended_settings)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (
+            platform_data['platform_name'],
+            platform_data.get('display_name', platform_data['platform_name']),
+            platform_data['rtmp_url'],
+            platform_data.get('supports_auth', False),
+            platform_data.get('max_bitrate', 6000),
+            recommended
+        ))
+
+        platform_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return platform_id
+
+    def get_platform_config(self, platform_name):
+        """Get a specific platform configuration"""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        cursor.execute('SELECT * FROM platform_configs WHERE platform_name = ?', (platform_name,))
+        row = cursor.fetchone()
+        conn.close()
+
+        if not row:
+            return None
+
+        platform = dict(row)
+        try:
+            platform['recommended_settings'] = json.loads(platform['recommended_settings'] or '{}')
+        except (ValueError, TypeError):
+            platform['recommended_settings'] = {}
+        return platform
+
+    def update_platform_config(self, platform_name, platform_data):
+        """Update a platform configuration"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        update_fields = []
+        values = []
+
+        for field in ['display_name', 'rtmp_url', 'supports_auth', 'max_bitrate', 'active']:
+            if field in platform_data:
+                update_fields.append(f'{field} = ?')
+                values.append(platform_data[field])
+
+        if 'recommended_settings' in platform_data:
+            recommended = platform_data['recommended_settings']
+            if not isinstance(recommended, str):
+                recommended = json.dumps(recommended)
+            update_fields.append('recommended_settings = ?')
+            values.append(recommended)
+
+        if not update_fields:
+            conn.close()
+            return False
+
+        values.append(platform_name)
+        cursor.execute(f'UPDATE platform_configs SET {", ".join(update_fields)} WHERE platform_name = ?', values)
+
+        success = cursor.rowcount > 0
+        conn.commit()
+        conn.close()
+        return success
+
+    def delete_platform_config(self, platform_name):
+        """Delete a platform configuration"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute('DELETE FROM platform_configs WHERE platform_name = ?', (platform_name,))
+
+        success = cursor.rowcount > 0
+        conn.commit()
+        conn.close()
+        return success
+
+    def get_project_streams(self, project_id):
+        """Get all streams belonging to a project"""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        cursor.execute('SELECT * FROM streams WHERE project_id = ? ORDER BY created_at DESC', (project_id,))
+        streams = [self._parse_stream_row(row) for row in cursor.fetchall()]
+
+        conn.close()
+        return streams
+
+    def reset_stale_statuses(self):
+        """Mark all streams stopped. Called at startup: no stream can be live
+        before the manager has started any processes."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            UPDATE streams
+            SET status = 'stopped', start_time = NULL, updated_at = CURRENT_TIMESTAMP
+            WHERE status != 'stopped'
+        ''')
+
+        reset_count = cursor.rowcount
+        conn.commit()
+        conn.close()
+
+        if reset_count:
+            logger.info(f"Reset {reset_count} stale stream status(es) to stopped")
 
 class StreamInstance:
     """Individual stream instance with process management"""
@@ -850,7 +1092,15 @@ class StreamInstance:
         self.last_recovery_attempt = 0
         self.recovery_in_progress = False
         self.active_recovery_id = None
-        
+
+        # Derive a stable per-stream number for the X display / Chrome debug
+        # port. Stream IDs are UUIDs, so hash them to a small integer instead
+        # of assuming the last character is a digit.
+        digest = hashlib.sha1(str(self.config['id']).encode()).hexdigest()
+        self.instance_num = int(digest[:6], 16) % 500
+        self.display_name = f":{100 + self.instance_num}"
+        self.debug_port = 9300 + self.instance_num
+
         # Quality settings (horizontal presets)
         self.quality_presets = {
             'low': {'resolution': '854x480', 'bitrate': '1000k', 'framerate': '24'},
@@ -874,59 +1124,33 @@ class StreamInstance:
         self.platform_configs = {}
         self._load_platform_configs()
         
-        # Audio configuration
-        self.audio_config = self.config.get('audio_config', {})
-        self.multi_stream_targets = self.config.get('multi_stream_targets', [])
-    
-    def _load_platform_configs(self):
-        """Load platform configurations from database"""
-        try:
-            platforms = self.db.get_platform_configs()
-            for platform in platforms:
-                self.platform_configs[platform['platform_name']] = platform
-        except Exception as e:
-            logger.error(f"Failed to load platform configs: {e}")
-            # Fallback to basic configs
-            self.platform_configs = {
-                'youtube': {'rtmp_url': 'rtmp://a.rtmp.youtube.com/live2/'},
-                'twitch': {'rtmp_url': 'rtmp://live.twitch.tv/live/'},
-                'facebook': {'rtmp_url': 'rtmps://live-api-s.facebook.com:443/rtmp/'},
-                'tiktok': {'rtmp_url': 'rtmp://push.tiktokcdn.com/live/'},
-                'instagram': {'rtmp_url': 'rtmps://live-upload.instagram.com/rtmp/'}
-            }
-    
+        # Audio configuration (config values are decoded by StreamDatabase,
+        # but guard against raw JSON strings from older code paths)
+        audio_config = self.config.get('audio_config', {})
+        if isinstance(audio_config, str):
+            try:
+                audio_config = json.loads(audio_config)
+            except (ValueError, TypeError):
+                audio_config = {}
+        self.audio_config = audio_config if isinstance(audio_config, dict) else {}
+
+        targets = self.config.get('multi_stream_targets', [])
+        if isinstance(targets, str):
+            try:
+                targets = json.loads(targets)
+            except (ValueError, TypeError):
+                targets = []
+        self.multi_stream_targets = targets if isinstance(targets, list) else []
+
+
     def start_streaming(self):
         """Start the streaming process"""
         if self.status == "live":
             return False, "Stream is already running"
         
         try:
-            # Handle custom quality settings
-            if self.config.get('quality') == 'custom' and 'custom_settings' in self.config:
-                custom = self.config['custom_settings']
-                quality = {
-                    'resolution': custom.get('resolution', '1280x720'),
-                    'bitrate': custom.get('bitrate', '2500') + 'k',
-                    'framerate': custom.get('framerate', '30')
-                }
-            else:
-                # Choose quality preset based on orientation preference
-                orientation = self.config.get('orientation', 'auto')
-                platform = self.config.get('platform', '')
-                
-                # Determine effective orientation
-                if orientation == 'auto':
-                    use_vertical = platform in self.vertical_platforms
-                elif orientation == 'vertical':
-                    use_vertical = True
-                else:  # horizontal
-                    use_vertical = False
-                
-                if use_vertical:
-                    quality = self.vertical_quality_presets.get(self.config.get('quality', 'medium'))
-                else:
-                    quality = self.quality_presets.get(self.config.get('quality', 'medium'))
-            
+            quality = self._get_effective_quality()
+
             # Use smart streaming approach - detects headless vs X11 automatically
             self._start_smart_streaming(quality)
             
@@ -944,6 +1168,31 @@ class StreamInstance:
             self.cleanup()
             return False, f"Error starting stream: {e}"
     
+    def _get_effective_quality(self):
+        """Resolve the stream's quality settings: custom values if configured,
+        otherwise the preset matching the effective orientation"""
+        if self.config.get('quality') == 'custom' and self.config.get('custom_settings'):
+            custom = self.config['custom_settings']
+            return {
+                'resolution': custom.get('resolution', '1280x720'),
+                'bitrate': str(custom.get('bitrate', '2500')).rstrip('k') + 'k',
+                'framerate': str(custom.get('framerate', '30'))
+            }
+
+        # Choose quality preset based on orientation preference
+        orientation = self.config.get('orientation', 'auto')
+        platform = self.config.get('platform', '')
+
+        if orientation == 'auto':
+            use_vertical = platform in self.vertical_platforms
+        elif orientation == 'vertical':
+            use_vertical = True
+        else:  # horizontal
+            use_vertical = False
+
+        presets = self.vertical_quality_presets if use_vertical else self.quality_presets
+        return presets.get(self.config.get('quality', 'medium')) or presets['medium']
+
     def _start_smart_streaming(self, quality):
         """Start streaming using smart detection with progressive fallbacks"""
         try:
@@ -956,6 +1205,9 @@ class StreamInstance:
                     self._start_headless_streaming(quality)
                 except Exception as e:
                     logger.error(f"Headless streaming failed: {e}")
+                    # Kill any partially-started pipeline before falling back,
+                    # or an orphaned FFmpeg keeps fighting for the RTMP endpoint
+                    self.cleanup()
                     # Fallback to simple test pattern streaming for low-memory VPS
                     logger.info("Falling back to test pattern streaming for low-memory system...")
                     self._start_test_pattern_streaming(quality)
@@ -965,39 +1217,38 @@ class StreamInstance:
                     self._start_x11_streaming(quality)
                 except Exception as e:
                     logger.error(f"X11 streaming failed: {e}")
+                    self.cleanup()
                     # Fallback to headless
                     logger.info("Falling back to headless streaming...")
                     try:
                         self._start_headless_streaming(quality)
                     except Exception as e2:
                         logger.error(f"Headless fallback also failed: {e2}")
+                        self.cleanup()
                         # Final fallback to test pattern
                         logger.info("Final fallback to test pattern streaming...")
                         self._start_test_pattern_streaming(quality)
-                
+
         except Exception as e:
             logger.error(f"Error in smart streaming setup: {e}")
             # Emergency fallback
             logger.info("Emergency fallback to test pattern streaming...")
+            self.cleanup()
             self._start_test_pattern_streaming(quality)
     
     def _detect_headless_system(self):
-        """Detect if we're running on a headless system"""
+        """Detect if we're running on a headless system (no X11 available).
+        Headless is preferred: it's cheaper and doesn't need Xvfb."""
         try:
-            # Check if DISPLAY is set and accessible
-            if os.environ.get('DISPLAY'):
-                # Try to connect to X server
+            # An active X display means we can use x11grab directly
+            if os.environ.get('DISPLAY') and shutil.which('xset'):
                 result = subprocess.run(['xset', 'q'], capture_output=True, timeout=5)
                 if result.returncode == 0:
                     return False  # X11 available
-            
-            # Check if we're in a known headless environment
-            if os.path.exists('/usr/bin/chromium-browser') and not os.path.exists('/usr/bin/Xorg'):
-                return True
-                
+
             # Default to headless if uncertain
             return True
-            
+
         except Exception:
             # If detection fails, assume headless
             return True
@@ -1018,49 +1269,61 @@ class StreamInstance:
     def _start_x11_streaming(self, quality):
         """Start traditional X11 streaming with Xvfb"""
         logger.info("Starting X11 streaming with virtual display...")
-        
-        # Start virtual display
-        display_port = f":9{self.config['id'][-1]}"
+
+        if not shutil.which('Xvfb'):
+            raise Exception("Xvfb is not installed")
+
+        # Start virtual display (display number derived from the stream ID)
+        display_port = self.display_name
         self.processes['display'] = subprocess.Popen([
             'Xvfb', display_port, '-screen', '0', f"{quality['resolution']}x24", '-ac'
         ])
-        
+
         time.sleep(2)  # Allow Xvfb to start
-        
+
+        if self.processes['display'].poll() is not None:
+            raise Exception(f"Xvfb failed to start on display {display_port}")
+
         env = os.environ.copy()
         env['DISPLAY'] = display_port
-        
+
         # Start content renderer
         if self.config['type'] == 'html':
             self._start_html_renderer(env, quality)
         elif self.config['type'] == 'pygame':
             self._start_pygame_renderer(env)
-        
+        else:
+            raise Exception(f"Unsupported content type: {self.config['type']}")
+
         time.sleep(3)  # Allow content to start
-        
+
         # Start FFmpeg streaming
         self._start_ffmpeg_stream(env, quality)
     
     def _start_headless_html_streaming(self, quality):
-        """Start headless HTML streaming using Chrome DevTools Protocol"""
+        """Start headless HTML streaming: Chrome renders the page, the
+        capture_html.py helper pulls real frames out via the DevTools
+        screencast API, and FFmpeg encodes them to RTMP."""
         try:
-            # Start Chrome in headless mode with remote debugging
-            chrome_port = 9222 + int(self.config['id'][-1])  # Unique port per stream
-            
+            browser = find_browser()
+            if not browser:
+                raise Exception("No Chromium/Chrome browser found. Install chromium-browser.")
+
+            chrome_port = self.debug_port  # Unique port per stream
+
             # Detect available memory for optimization
             import psutil
             total_memory_mb = psutil.virtual_memory().total // (1024 * 1024)
-            
+
             chrome_cmd = [
-                'chromium-browser',
-                '--headless',
+                browser,
+                '--headless=new',
                 '--disable-gpu',
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',  # CRITICAL for low memory
                 '--disable-extensions',
                 '--disable-plugins',
-                '--disable-images',  # Optimize for streaming
                 '--disable-background-timer-throttling',
                 '--disable-backgrounding-occluded-windows',
                 '--disable-renderer-backgrounding',
@@ -1073,103 +1336,142 @@ class StreamInstance:
                 '--disable-sync',
                 '--memory-pressure-off',
                 '--mute-audio',
+                '--hide-scrollbars',
                 f'--window-size={quality["resolution"].replace("x", ",")}',
                 f'--remote-debugging-port={chrome_port}',
-                '--enable-logging',
-                '--log-level=0'
+                '--remote-debugging-address=127.0.0.1',
+                f'--remote-allow-origins=http://127.0.0.1:{chrome_port}',
+                f'--user-data-dir=/tmp/streamdrop-chrome-{self.instance_num}',
             ]
-            
+
             # Add aggressive memory optimizations for low-memory systems
             if total_memory_mb < 1024:
                 chrome_cmd.extend([
                     '--single-process',  # Run in single process mode
                     '--no-zygote',  # Don't use zygote process
-                    '--max_old_space_size=96',  # Limit V8 heap to 96MB
-                    '--js-flags="--max-old-space-size=96 --max-semi-space-size=2"',
-                    '--aggressive-cache-discard',
-                    '--aggressive-tab-discard',
+                    '--js-flags=--max-old-space-size=96',
                     '--enable-low-end-device-mode',
                     '--disable-site-isolation-trials',
                     '--disable-features=site-per-process'
                 ])
                 logger.info(f"Applied low-memory optimizations (system has {total_memory_mb}MB)")
             elif total_memory_mb < 2048:
-                chrome_cmd.extend([
-                    '--max_old_space_size=256',  # Limit V8 heap to 256MB
-                    '--js-flags="--max-old-space-size=256"'
-                ])
-            else:
-                chrome_cmd.append('--max_old_space_size=512')
-                
+                chrome_cmd.append('--js-flags=--max-old-space-size=256')
+
             chrome_cmd.append(self.config['source'])
-            
+
             logger.info(f"Starting headless Chrome: {' '.join(chrome_cmd[:8])}...")
-            self.processes['chrome'] = subprocess.Popen(chrome_cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
-            
+            # Send Chrome output to a log file: an unread PIPE fills up and
+            # blocks Chrome after a while, killing 24/7 streams.
+            chrome_log_path = f'/tmp/streamdrop-chrome-{self.instance_num}.log'
+            self._chrome_log = open(chrome_log_path, 'wb')
+            self.processes['chrome'] = subprocess.Popen(
+                chrome_cmd, stderr=self._chrome_log, stdout=self._chrome_log)
+
             # Wait for Chrome to start and check if it's still running
             time.sleep(3)
-            
+
             if self.processes['chrome'].poll() is not None:
                 # Chrome died immediately
-                stderr_output = self.processes['chrome'].stderr.read().decode() if self.processes['chrome'].stderr else "No error output"
+                try:
+                    with open(chrome_log_path, 'r', errors='replace') as f:
+                        stderr_output = f.read()
+                except OSError:
+                    stderr_output = "No error output"
                 logger.error(f"Chrome died immediately. Error: {stderr_output[:1000]}")
-                
+
                 # Check for common memory-related errors
                 if "Shared memory" in stderr_output or "/dev/shm" in stderr_output:
                     logger.error("Chrome crashed due to shared memory limits. System may need more RAM or larger /dev/shm")
                     logger.info("Falling back to test pattern streaming...")
+                    self.cleanup()
                     return self._start_test_pattern_streaming(quality)
                 elif "memory" in stderr_output.lower() or "oom" in stderr_output.lower():
                     logger.error("Chrome crashed due to out of memory. System needs more RAM.")
                     logger.info("Falling back to test pattern streaming...")
+                    self.cleanup()
                     return self._start_test_pattern_streaming(quality)
-                    
+
                 raise Exception(f"Chrome failed to start: {stderr_output[:500]}")
-            
+
             # Verify Chrome is responding on debug port
-            import socket
-            max_retries = 10
+            max_retries = 15
             for i in range(max_retries):
                 try:
                     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     sock.settimeout(1)
-                    result = sock.connect_ex(('localhost', chrome_port))
+                    result = sock.connect_ex(('127.0.0.1', chrome_port))
                     sock.close()
                     if result == 0:
                         logger.info(f"Chrome debug port {chrome_port} is responding")
                         break
-                except:
+                except OSError:
                     pass
                 time.sleep(1)
             else:
-                logger.warning(f"Chrome debug port {chrome_port} not responding after {max_retries}s")
-            
-            # Start FFmpeg to capture from Chrome via CDP and stream
-            self._start_headless_ffmpeg_stream(quality, chrome_port)
-            
+                raise Exception(f"Chrome debug port {chrome_port} not responding after {max_retries}s")
+
+            # Start the frame capture helper (JPEG frames on its stdout)
+            width, height = quality['resolution'].split('x')
+            capture_cmd = [
+                sys.executable, os.path.join(BASE_DIR, 'capture_html.py'),
+                '--port', str(chrome_port),
+                '--fps', str(quality['framerate']),
+                '--width', width,
+                '--height', height,
+            ]
+            logger.info("Starting DevTools screencast capture...")
+            self.processes['capture'] = subprocess.Popen(
+                capture_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL
+            )
+
+            # FFmpeg encodes the captured frames and pushes to RTMP
+            self._start_pipe_ffmpeg_stream(quality, self.processes['capture'].stdout)
+
+            # Confirm the pipeline survived startup
+            time.sleep(3)
+            for name in ('capture', 'ffmpeg'):
+                if self.processes.get(name) and self.processes[name].poll() is not None:
+                    raise Exception(f"Headless pipeline process '{name}' exited during startup")
+
         except Exception as e:
             logger.error(f"Failed to start headless HTML streaming: {e}")
             raise
     
     def _start_headless_pygame_streaming(self, quality):
-        """Start headless Pygame streaming using memory surfaces"""
+        """Start headless Pygame streaming: capture_pygame.py runs the game
+        with SDL's dummy driver and pipes real frames to FFmpeg."""
         try:
-            # Set SDL to use dummy video driver (no display needed)
-            env = os.environ.copy()
-            env['SDL_VIDEODRIVER'] = 'dummy'
-            env['SDL_AUDIODRIVER'] = 'dummy'
-            
-            # Start the pygame application
-            pygame_cmd = ['python3', self.config['source']]
-            
-            logger.info(f"Starting headless Pygame: {' '.join(pygame_cmd)}")
-            self.processes['pygame'] = subprocess.Popen(pygame_cmd, env=env)
-            
+            if not os.path.exists(self.config['source']):
+                raise Exception(f"Pygame script not found: {self.config['source']}")
+
+            capture_cmd = [
+                sys.executable, os.path.join(BASE_DIR, 'capture_pygame.py'),
+                '--fps', str(quality['framerate']),
+                self.config['source'],
+            ]
+
+            logger.info(f"Starting headless Pygame capture: {self.config['source']}")
+            self.processes['capture'] = subprocess.Popen(
+                capture_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL
+            )
+
             time.sleep(2)  # Allow pygame to start
-            
-            # Start FFmpeg to capture pygame output and stream
-            self._start_headless_pygame_ffmpeg(quality)
-            
+
+            if self.processes['capture'].poll() is not None:
+                raise Exception("Pygame capture process exited during startup")
+
+            # Start FFmpeg to encode the captured frames and stream
+            self._start_pipe_ffmpeg_stream(quality, self.processes['capture'].stdout)
+
+            time.sleep(3)
+            if self.processes['ffmpeg'].poll() is not None:
+                raise Exception("FFmpeg exited during startup")
+
         except Exception as e:
             logger.error(f"Failed to start headless Pygame streaming: {e}")
             raise
@@ -1178,24 +1480,30 @@ class StreamInstance:
         """Start simple test pattern streaming - reliable fallback for low-memory systems"""
         try:
             logger.info("Starting test pattern streaming - reliable mode for low-memory VPS")
-            
+
             # Create a simple but informative test pattern
             pattern_type = "testsrc2" if "html" in self.config.get('type', 'html').lower() else "mandelbrot"
-            
-            # Generate stream info overlay
-            stream_name = self.config.get('name', 'StreamDrop Stream').replace(':', '-')
+
+            # Generate stream info overlay (strip characters that break drawtext)
+            stream_name = self.config.get('name', 'StreamDrop Stream')
+            for bad_char in (':', "'", '"', '%', '\\'):
+                stream_name = stream_name.replace(bad_char, '')
+            stream_name = stream_name or 'StreamDrop Stream'
             platform = self.config.get('platform', 'Unknown')
-            
+            bottom_y = int(quality["resolution"].split("x")[1]) - 40
+
             ffmpeg_cmd = [
                 'ffmpeg',
+                '-re',  # pace generated input at realtime, like a live source
                 '-f', 'lavfi',
                 '-i', f'{pattern_type}=size={quality["resolution"]}:rate={quality["framerate"]}',
-                '-f', 'lavfi', 
-                '-i', f'anullsrc=channel_layout=stereo:sample_rate=44100',
-                '-vf', f'drawtext=text="{stream_name}":x=10:y=10:fontsize=24:fontcolor=white,'
-                       f'drawtext=text="Platform: {platform}":x=10:y=50:fontsize=18:fontcolor=yellow,'
-                       f'drawtext=text="StreamDrop Active":x=10:y=80:fontsize=18:fontcolor=lime,'
-                       f'drawtext=text="%{{localtime\\:%Y-%m-%d %H\\:%M\\:%S}}":x=10:y={quality["resolution"].split("x")[1].rstrip()-40}:fontsize=16:fontcolor=white',
+                '-re',
+                '-f', 'lavfi',
+                '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+                '-vf', f'drawtext=text=\'{stream_name}\':x=10:y=10:fontsize=24:fontcolor=white,'
+                       f'drawtext=text=\'Platform {platform}\':x=10:y=50:fontsize=18:fontcolor=yellow,'
+                       f'drawtext=text=\'StreamDrop Active\':x=10:y=80:fontsize=18:fontcolor=lime,'
+                       f'drawtext=text=\'%{{localtime\\:%Y-%m-%d %X}}\':x=10:y={bottom_y}:fontsize=16:fontcolor=white',
                 '-c:v', 'libx264',
                 '-preset', 'veryfast',
                 '-pix_fmt', 'yuv420p',
@@ -1203,83 +1511,99 @@ class StreamInstance:
                 '-b:v', quality['bitrate'],
                 '-b:a', '128k',
                 '-maxrate', quality['bitrate'],
-                '-bufsize', str(int(quality['bitrate'].rstrip('k')) * 2) + 'k',
-                '-g', '60',
+                '-bufsize', str(int(str(quality['bitrate']).rstrip('k')) * 2) + 'k',
+                '-g', str(int(quality['framerate']) * 2),
                 '-r', str(quality['framerate']),
-                '-f', 'flv',
-                self._build_rtmp_url(self.config['platform'], self.config['stream_key'], self.config.get('rtmp_url'))
-            ]
-            
+            ] + self._ffmpeg_output_args()
+
             logger.info("Starting test pattern FFmpeg stream - this will work on any VPS size")
-            env = os.environ.copy()
-            self.processes['ffmpeg'] = subprocess.Popen(ffmpeg_cmd, env=env)
-            
+            self.processes['ffmpeg'] = subprocess.Popen(
+                ffmpeg_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+
             # No Chrome process needed for test pattern
             logger.info(f"Test pattern stream started successfully for {stream_name}")
-            
+
         except Exception as e:
             logger.error(f"Failed to start test pattern streaming: {e}")
             raise
-    
-    def _start_headless_ffmpeg_stream(self, quality, chrome_port):
-        """Start FFmpeg for headless HTML streaming"""
-        # For headless HTML, we'll use a simpler approach - generate test pattern for now
-        # TODO: Implement proper Chrome DevTools Protocol screenshot capture
+
+    def _ffmpeg_output_args(self):
+        """Build the FFmpeg output section: single RTMP target, or tee for multi-streaming"""
+        targets = self._get_stream_targets()
+        if len(targets) == 1:
+            return ['-f', 'flv', targets[0]]
+        tee_outputs = '|'.join(f'[f=flv:onfail=ignore]{target}' for target in targets)
+        return ['-map', '0:v', '-map', '1:a', '-f', 'tee', tee_outputs]
+
+    def _start_pipe_ffmpeg_stream(self, quality, frame_pipe):
+        """Start FFmpeg reading JPEG frames from a capture process pipe and
+        pushing encoded video (with a silent audio track) to RTMP"""
+        # Normalize frames to the exact preset resolution: capture sources
+        # (browser viewports, pygame windows) pick their own sizes, while
+        # streaming platforms expect a fixed, even-dimensioned canvas.
+        width, height = quality['resolution'].split('x')
         ffmpeg_cmd = [
             'ffmpeg',
+            '-f', 'image2pipe',
+            '-framerate', str(quality['framerate']),
+            '-i', '-',
             '-f', 'lavfi',
-            '-i', f'testsrc=size={quality["resolution"]}:rate={quality["framerate"]}',
-            '-pix_fmt', 'yuv420p',
+            '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+            '-vf', f'scale={width}:{height}:force_original_aspect_ratio=decrease,'
+                   f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black',
+        ]
+
+        ffmpeg_cmd.extend([
             '-c:v', 'libx264',
             '-preset', 'veryfast',
             '-b:v', quality['bitrate'],
             '-maxrate', quality['bitrate'],
-            '-bufsize', str(int(quality['bitrate'].rstrip('k')) * 2) + 'k',
-            '-g', '60',
-            '-f', 'flv',
-            self._build_rtmp_url(self.config['platform'], self.config['stream_key'], self.config.get('rtmp_url'))
-        ]
-        
-        logger.info(f"Starting headless FFmpeg stream...")
-        env = os.environ.copy()
-        self.processes['ffmpeg'] = subprocess.Popen(ffmpeg_cmd, env=env)
-    
-    def _start_headless_pygame_ffmpeg(self, quality):
-        """Start FFmpeg for headless Pygame streaming"""
-        # For headless pygame, generate test pattern for now  
-        # TODO: Implement proper pygame surface capture
-        ffmpeg_cmd = [
-            'ffmpeg',
-            '-f', 'lavfi',
-            '-i', f'testsrc=size={quality["resolution"]}:rate={quality["framerate"]}',
+            '-bufsize', str(int(str(quality['bitrate']).rstrip('k')) * 2) + 'k',
             '-pix_fmt', 'yuv420p',
-            '-c:v', 'libx264',
-            '-preset', 'veryfast',
-            '-b:v', quality['bitrate'],
-            '-maxrate', quality['bitrate'],
-            '-bufsize', str(int(quality['bitrate'].rstrip('k')) * 2) + 'k',
-            '-g', '60',
-            '-f', 'flv',
-            self._build_rtmp_url(self.config['platform'], self.config['stream_key'], self.config.get('rtmp_url'))
-        ]
-        
-        logger.info(f"Starting headless Pygame FFmpeg stream...")
-        env = os.environ.copy()
-        self.processes['ffmpeg'] = subprocess.Popen(ffmpeg_cmd, env=env)
-    
-    
+            '-g', str(int(quality['framerate']) * 2),
+            '-r', str(quality['framerate']),
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            '-ar', '44100',
+            # anullsrc is infinite: without -shortest, FFmpeg would keep
+            # streaming silence forever after the frame pipe closes
+            '-shortest',
+        ] + self._ffmpeg_output_args())
+
+        logger.info("Starting FFmpeg (frame pipe -> RTMP)...")
+        self.processes['ffmpeg'] = subprocess.Popen(
+            ffmpeg_cmd,
+            stdin=frame_pipe,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        # FFmpeg holds its own copy of the pipe now; drop ours
+        try:
+            frame_pipe.close()
+        except OSError:
+            pass
+
+
     def _start_html_renderer(self, env, quality):
-        """Start Chrome for HTML content"""
+        """Start Chrome for HTML content, rendering into the virtual X display.
+        Must NOT be headless: FFmpeg captures the display with x11grab."""
+        browser = find_browser()
+        if not browser:
+            raise Exception("No Chromium/Chrome browser found. Install chromium-browser.")
+
         chrome_cmd = [
-            'chromium-browser',  # Use chromium-browser consistently
-            '--headless',
+            browser,
+            '--kiosk',
+            '--window-position=0,0',
             '--disable-gpu',
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
             '--disable-extensions',
             '--disable-plugins',
-            '--disable-images',
             '--disable-background-timer-throttling',
             '--disable-backgrounding-occluded-windows',
             '--disable-renderer-backgrounding',
@@ -1290,28 +1614,30 @@ class StreamInstance:
             '--disable-component-update',
             '--disable-default-apps',
             '--disable-sync',
+            '--disable-infobars',
+            '--no-first-run',
             '--memory-pressure-off',
-            '--max_old_space_size=128',
+            '--mute-audio',
+            '--hide-scrollbars',
             f'--window-size={quality["resolution"].replace("x", ",")}',
-            '--remote-debugging-port=9222',
-            '--remote-debugging-address=0.0.0.0',
+            f'--user-data-dir=/tmp/streamdrop-chrome-{self.instance_num}',
             self.config['source']
         ]
-        
+
         self.processes['renderer'] = subprocess.Popen(
             chrome_cmd,
             env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
         )
-    
+
     def _start_pygame_renderer(self, env):
         """Start pygame script"""
         if not os.path.exists(self.config['source']):
             raise Exception(f"Pygame script not found: {self.config['source']}")
-        
+
         self.processes['renderer'] = subprocess.Popen([
-            'python3', self.config['source']
+            sys.executable, self.config['source']
         ], env=env)
     
     def _start_ffmpeg_stream(self, env, quality):
@@ -1363,26 +1689,17 @@ class StreamInstance:
             ])
         else:
             ffmpeg_cmd.extend(['-c:a', 'aac', '-b:a', '128k'])
-        
-        # Multi-streaming support
-        targets = self._get_stream_targets()
-        
-        if len(targets) == 1:
-            # Single stream
-            ffmpeg_cmd.extend(['-f', 'flv', targets[0]])
-        else:
-            # Multi-streaming using tee muxer
-            ffmpeg_cmd.extend(['-f', 'tee'])
-            tee_outputs = '|'.join([f'[f=flv]{target}' for target in targets])
-            ffmpeg_cmd.append(tee_outputs)
-        
+
+        # Output target(s): single RTMP URL or tee muxer for multi-streaming
+        ffmpeg_cmd.extend(self._ffmpeg_output_args())
+
         logger.info(f"Starting FFmpeg with command: {' '.join(ffmpeg_cmd[:10])}... (truncated)")
-        
+
         self.processes['ffmpeg'] = subprocess.Popen(
             ffmpeg_cmd,
             env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
         )
     
     def _get_stream_targets(self):
@@ -1437,8 +1754,17 @@ class StreamInstance:
                         pass
                 except:
                     pass
-        
+
         self.processes.clear()
+
+        # Close the Chrome log file handle if one was opened
+        chrome_log = getattr(self, '_chrome_log', None)
+        if chrome_log:
+            try:
+                chrome_log.close()
+            except OSError:
+                pass
+            self._chrome_log = None
     
     def get_uptime(self):
         """Get current stream uptime"""
@@ -1728,48 +2054,64 @@ class StreamInstance:
     def _restart_ffmpeg(self):
         """Restart only the FFmpeg process"""
         try:
+            # FFmpeg can only be restarted in isolation on the X11 path
+            # (x11grab reattaches to the still-running Xvfb display). Headless
+            # pipelines feed FFmpeg's stdin, and test-pattern streams have no
+            # display at all - restart those pipelines whole.
+            if 'capture' in self.processes or 'display' not in self.processes:
+                return self._full_restart()
+
             # Stop FFmpeg
             if 'ffmpeg' in self.processes and self.processes['ffmpeg']:
                 self.processes['ffmpeg'].terminate()
                 self.processes['ffmpeg'].wait(timeout=5)
-            
+
             time.sleep(2)
-            
-            # Restart FFmpeg
+
+            # Restart FFmpeg (X11 capture path)
             env = os.environ.copy()
-            env['DISPLAY'] = f":9{self.config['id'][-1]}"
-            
-            quality = self.quality_presets.get(self.config.get('quality', 'medium'))
-            self._start_ffmpeg_stream(env, quality)
-            
+            env['DISPLAY'] = self.display_name
+
+            self._start_ffmpeg_stream(env, self._get_effective_quality())
+
+            # Confirm it actually survived startup
+            time.sleep(2)
+            if self.processes['ffmpeg'].poll() is not None:
+                logger.error("Restarted FFmpeg exited immediately")
+                return False
+
             return True
-            
+
         except Exception as e:
             logger.error(f"Failed to restart FFmpeg: {e}")
             return False
-    
+
     def _restart_renderer(self):
         """Restart the content renderer process"""
         try:
+            # Headless pipelines have no standalone renderer to bounce
+            if 'capture' in self.processes:
+                return self._full_restart()
+
             # Stop renderer
             if 'renderer' in self.processes and self.processes['renderer']:
                 self.processes['renderer'].terminate()
                 self.processes['renderer'].wait(timeout=5)
-            
+
             time.sleep(2)
-            
+
             # Restart renderer
             env = os.environ.copy()
-            env['DISPLAY'] = f":9{self.config['id'][-1]}"
-            quality = self.quality_presets.get(self.config.get('quality', 'medium'))
-            
+            env['DISPLAY'] = self.display_name
+            quality = self._get_effective_quality()
+
             if self.config['type'] == 'html':
                 self._start_html_renderer(env, quality)
             elif self.config['type'] == 'pygame':
                 self._start_pygame_renderer(env)
-            
+
             return True
-            
+
         except Exception as e:
             logger.error(f"Failed to restart renderer: {e}")
             return False
@@ -1847,14 +2189,17 @@ class StreamInstance:
         try:
             # Clean up all processes
             self.cleanup()
-            
+
+            # start_streaming() refuses to run while status is "live"
+            self.status = "stopped"
+
             # Wait before restarting
             time.sleep(3)
-            
+
             # Restart the entire stream
             success, message = self.start_streaming()
             return success
-            
+
         except Exception as e:
             logger.error(f"Failed to perform full restart: {e}")
             return False
@@ -1864,6 +2209,9 @@ class StreamManager:
     
     def __init__(self):
         self.db = StreamDatabase()
+        # Any 'live'/'error' rows in the DB are stale after a restart: no
+        # processes exist yet, so reflect reality before serving requests.
+        self.db.reset_stale_statuses()
         self.active_streams = {}
         self.monitor_thread = None
         self.monitoring = False
@@ -2008,6 +2356,11 @@ class StreamManager:
     def create_stream(self, stream_data):
         """Create a new stream"""
         try:
+            required = ['name', 'type', 'platform', 'stream_key', 'source']
+            missing = [field for field in required if not stream_data.get(field)]
+            if missing:
+                return False, None, f"Missing required fields: {', '.join(missing)}"
+
             stream_id = self.db.create_stream(stream_data)
             logger.info(f"Created stream {stream_data['name']} with ID {stream_id}")
             return True, stream_id, "Stream created successfully"
@@ -2136,10 +2489,31 @@ class StreamManager:
         self.stop_monitoring()
         logger.info("All streams cleaned up")
 
+def _load_or_create_secret_key():
+    """Persist the Flask session key so restarts don't log everyone out"""
+    env_key = os.environ.get('FLASK_SECRET_KEY')
+    if env_key:
+        return env_key
+
+    secret_path = os.path.join(BASE_DIR, '.streamdrop_secret')
+    try:
+        if os.path.exists(secret_path):
+            with open(secret_path, 'r') as f:
+                key = f.read().strip()
+                if key:
+                    return key
+        key = os.urandom(24).hex()
+        with open(secret_path, 'w') as f:
+            f.write(key)
+        os.chmod(secret_path, 0o600)
+        return key
+    except OSError as e:
+        logger.warning(f"Could not persist secret key ({e}); sessions will reset on restart")
+        return os.urandom(24).hex()
+
 # Create Flask app
 app = Flask(__name__)
-# Set secret key for sessions (generate random key if not exists)
-app.secret_key = os.environ.get('FLASK_SECRET_KEY', os.urandom(24).hex())
+app.secret_key = _load_or_create_secret_key()
 stream_manager = StreamManager()
 
 def check_auth(username, password):
@@ -2453,9 +2827,9 @@ def api_update_stream_audio(stream_id):
     """Update stream audio configuration"""
     try:
         audio_config = request.json
-        
+
         success = stream_manager.db.update_stream(stream_id, {
-            'audio_input': json.dumps(audio_config)
+            'audio_config': audio_config
         })
         
         return jsonify({"success": success, "message": "Audio configuration updated" if success else "Failed to update audio"})

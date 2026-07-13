@@ -24,6 +24,7 @@ class HTMLStreamer:
     def __init__(self, stream_key='', content_path=''):
         self.process = None
         self.display_process = None
+        self.ffmpeg_process = None
         self.status = "stopped"
         self.stream_key = stream_key
         self.content_path = content_path

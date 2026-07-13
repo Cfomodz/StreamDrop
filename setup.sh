@@ -231,7 +231,7 @@ if detect_headless; then
     echo -e "${BLUE}🎬 Installing minimal dependencies for headless streaming...${NC}"
     
     # Install packages with fallback for older Ubuntu versions
-    PACKAGES="ffmpeg libnss3 libdrm2 libgbm1"
+    PACKAGES="ffmpeg libnss3 libdrm2 libgbm1 fonts-liberation fonts-dejavu-core fontconfig"
     
     # Handle Ubuntu 24.04+ package name changes (t64 suffix)
     if apt-cache show libatk-bridge2.0-0t64 >/dev/null 2>&1; then
@@ -259,7 +259,7 @@ else
         echo -e "${BLUE}🎬 Installing full dependencies with X11 support...${NC}"
         
         # Full packages with dev libraries (for X11 support)
-        FULL_PACKAGES="xvfb ffmpeg libnss3-dev libdrm-dev libxcomposite-dev libxdamage-dev libxrandr-dev libgbm-dev libxss-dev"
+        FULL_PACKAGES="xvfb ffmpeg fonts-liberation fonts-dejavu-core fontconfig libnss3-dev libdrm-dev libxcomposite-dev libxdamage-dev libxrandr-dev libgbm-dev libxss-dev"
         
         # Handle Ubuntu 24.04+ package name changes for dev packages
         if apt-cache show libatk-bridge2.0-dev >/dev/null 2>&1; then
@@ -280,7 +280,7 @@ else
         echo -e "${BLUE}🎬 Installing minimal dependencies for headless streaming...${NC}"
         
         # Same headless logic as above
-        PACKAGES="ffmpeg libnss3 libdrm2 libgbm1"
+        PACKAGES="ffmpeg libnss3 libdrm2 libgbm1 fonts-liberation fonts-dejavu-core fontconfig"
         
         if apt-cache show libatk-bridge2.0-0t64 >/dev/null 2>&1; then
             PACKAGES="$PACKAGES libatk-bridge2.0-0t64"

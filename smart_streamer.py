@@ -132,7 +132,7 @@ def start_optimal_streaming():
             streamer = PygameStreamer()
         else:
             from main import HTMLStreamer
-            streamer = HTMLStreamer()
+            streamer = HTMLStreamer(stream_key, content_path)
     
     # Start streaming
     success, message = streamer.start_streaming()
